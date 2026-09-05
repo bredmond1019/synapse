@@ -88,6 +88,11 @@ def _probe_pgvector(session) -> dict:
         result["reachable"] = False
         result["error"] = f"pgvector unreachable: {exc}"
         logging.warning("pulse: pgvector probe failed: %s", exc)
+        # A failed query leaves the session's transaction aborted; without this
+        # rollback, db_session()'s own session.commit() on generator cleanup
+        # raises PendingRollbackError, turning a reported "unreachable" into an
+        # actual 500 — the exact thing this module's docstring says never happens.
+        session.rollback()
 
     return result
 

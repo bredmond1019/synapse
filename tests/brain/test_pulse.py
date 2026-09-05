@@ -131,6 +131,36 @@ class TestPulseEmbeddingProbe:
         assert any("embedding backend unreachable" in err for err in report.errors)
 
 
+class TestPulseRecoversAbortedTransaction:
+    """A pgvector probe failure must roll back the session before returning.
+
+    Regression for the sandbox `jynxpoc` incident: a transient DB error mid-probe
+    (e.g. "server closed the connection unexpectedly") aborted the session's
+    transaction; `_probe_pgvector` caught the exception but never rolled back, so
+    `database.session.db_session`'s own cleanup `session.commit()` raised
+    `PendingRollbackError` — turning every subsequent `/pulse` call into a 500
+    until the process was restarted, contradicting this module's own contract
+    that pulse() never raises for a degraded backend. A real Postgres session's
+    exact "aborted transaction" error shape is awkward to reproduce cheaply and
+    portably in a unit test, so this asserts the fix directly: a failed probe
+    must call `session.rollback()`.
+    """
+
+    def test_probe_failure_rolls_back_the_session(self):
+        from unittest.mock import MagicMock
+
+        from brain.pulse import _probe_pgvector
+
+        session = MagicMock()
+        session.query.side_effect = RuntimeError("server closed the connection unexpectedly")
+
+        result = _probe_pgvector(session)
+
+        assert result["reachable"] is False
+        assert "server closed the connection unexpectedly" in result["error"]
+        session.rollback.assert_called_once()
+
+
 class TestPulseReportSerialization:
     """`to_dict()` produces a JSON-serializable payload (datetimes as ISO strings)."""
 
