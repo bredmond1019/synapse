@@ -562,6 +562,21 @@ primitives and reports a manual `--rebuild` follow-up for the rest (section-orph
 mismatches have no targeted delete primitive). See `docs/scripts.md` § `syn` for the full
 `stale --deep [--json] [--repair]` reference.
 
+**`syn refresh` now prunes deleted-but-embedded rows on every run, automatically.** Retiring a
+repo (deleting its files in a commit) previously left its `brain_documents` rows behind
+indefinitely — the incremental indexer only ever revisits paths it still walks on disk, so a
+deleted path's rows were never re-touched by the routine path, only by a manual `syn stale --deep
+--repair` or `--prune-paths`. Measured 2026-09-05/06: this let `syn recall` answer confidently
+about two retired repos (`amistad`, `rag-engine-rs`) out of rows whose source files no longer
+existed, scoring above the 0.6552 abstain threshold in `app/schemas/document_qa_schema.py`
+(fixed corpus-wide count: 257 deleted-but-embedded rows, none ever pruned by the routine path).
+`brain.ops.refresh()` now runs the same `reconcile.deep_stale` deleted-but-embedded sweep and
+`prune_paths` primitive right after its document-index step (skipped on `--dry-run`, since there
+is no dry-run write to skip), and reports the result under a `pruned` key —
+`{"deleted_but_embedded": N, "paths": [...]}` — so both `syn refresh` and the nightly `syn routine
+refresh` surface the count instead of cleaning silently. A prune failure is reported inside
+`pruned` (never raised), so the cron routine stays cron-safe on a bad run.
+
 ---
 
 ## Resetting and tearing down the store

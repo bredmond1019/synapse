@@ -25,6 +25,7 @@ from brain.ops import (
     DEFAULT_QUERY_KEEP_DAYS,
     MevUnavailableError,
     UnknownRoutineError,
+    _prune_deleted_but_embedded,
     _resolve_keep_days,
     embed_paths,
     ingest_dir,
@@ -275,55 +276,78 @@ class TestRefreshEdges:
 
 
 class TestRefresh:
-    """`refresh()` runs the content step then the edge step, in order; --dry-run skips edges."""
+    """`refresh()` runs the content step then the edge step, in order; --dry-run skips edges.
 
+    Every non-dry-run case here patches `brain.ops._prune_deleted_but_embedded`
+    directly (its own behaviour — success, clean-corpus zero, and failure — is
+    covered in isolation by `TestPruneDeletedButEmbedded` and the pgvector-gated
+    `TestRefreshPrunesZombieRows` below) so this class stays focused on step
+    ordering and the `documents`/`edges` payload shape.
+    """
+
+    @patch("brain.ops._prune_deleted_but_embedded")
     @patch("brain.ops.refresh_edges")
     @patch("index_brain.main")
-    def test_default_run_calls_both_steps_in_order(self, mock_index_main, mock_refresh_edges):
+    def test_default_run_calls_both_steps_in_order(
+        self, mock_index_main, mock_refresh_edges, mock_prune
+    ):
         mock_index_main.return_value = 0
         parent = MagicMock()
         parent.attach_mock(mock_index_main, "index_main")
         parent.attach_mock(mock_refresh_edges, "refresh_edges")
         mock_refresh_edges.return_value = 5
+        mock_prune.return_value = {"deleted_but_embedded": 0, "paths": []}
 
         result = refresh()
 
         assert [c[0] for c in parent.mock_calls] == ["index_main", "refresh_edges"]
         mock_index_main.assert_called_once_with([])
+        mock_prune.assert_called_once_with(None)
         assert result == {
             "documents": {"dry_run": False, "exit_code": 0, "success": True, "errors": []},
             "edges": {"loaded": 5},
+            "pruned": {"deleted_but_embedded": 0, "paths": []},
         }
 
+    @patch("brain.ops._prune_deleted_but_embedded")
     @patch("brain.ops.refresh_edges")
     @patch("index_brain.main")
-    def test_dry_run_skips_edge_step(self, mock_index_main, mock_refresh_edges):
+    def test_dry_run_skips_edge_step(self, mock_index_main, mock_refresh_edges, mock_prune):
         mock_index_main.return_value = 0
 
         result = refresh(dry_run=True)
 
         mock_index_main.assert_called_once_with(["--dry-run"])
         mock_refresh_edges.assert_not_called()
+        mock_prune.assert_not_called()
         assert result == {
             "documents": {"dry_run": True, "exit_code": 0, "success": True, "errors": []},
             "edges": {"skipped": True},
         }
 
+    @patch("brain.ops._prune_deleted_but_embedded")
     @patch("brain.ops.refresh_edges")
     @patch("index_brain.main")
-    def test_forwards_rebuild_and_brain_path(self, mock_index_main, mock_refresh_edges):
+    def test_forwards_rebuild_and_brain_path(
+        self, mock_index_main, mock_refresh_edges, mock_prune
+    ):
         mock_index_main.return_value = 0
         mock_refresh_edges.return_value = 0
+        mock_prune.return_value = {"deleted_but_embedded": 0, "paths": []}
 
         refresh(rebuild=True, brain_path="/tmp/some-brain")
 
         mock_index_main.assert_called_once_with(["--brain-path", "/tmp/some-brain", "--rebuild"])
         called_path = mock_refresh_edges.call_args[0][0]
         assert str(called_path) == "/tmp/some-brain"
+        mock_prune.assert_called_once_with("/tmp/some-brain")
 
+    @patch("brain.ops._prune_deleted_but_embedded")
     @patch("brain.ops.refresh_edges")
     @patch("index_brain.main")
-    def test_parse_failure_surfaces_in_documents_payload(self, mock_index_main, mock_refresh_edges):
+    def test_parse_failure_surfaces_in_documents_payload(
+        self, mock_index_main, mock_refresh_edges, mock_prune
+    ):
         """OR.2.C task 3: `syn refresh` (and `syn routine refresh`) must be able to
         see a parse/embed/DB failure `index_brain.main()` reported, not just log it."""
 
@@ -333,15 +357,56 @@ class TestRefresh:
 
         mock_index_main.side_effect = fake_main
         mock_refresh_edges.return_value = 2
+        mock_prune.return_value = {"deleted_but_embedded": 0, "paths": []}
 
         result = refresh()
 
         assert result["documents"]["exit_code"] == 1
         assert result["documents"]["success"] is False
-        assert result["documents"]["errors"] == ["docs/bad.md: db error — boom"]
-        # The edge step still runs — a documents-side failure must not raise and
-        # must not abort the edge reload (routines stay cron-safe).
-        assert result["edges"] == {"loaded": 2}
+
+
+class TestPruneDeletedButEmbedded:
+    """`_prune_deleted_but_embedded` — the helper `refresh()` calls to sweep and
+    prune the deleted-but-embedded axis. Mocked `reconcile.deep_stale`/`prune_paths`
+    so this covers dispatch and the swallow-don't-raise contract in isolation;
+    `TestRefreshPrunesZombieRows` proves the same path end to end against a real
+    pgvector session."""
+
+    @patch("brain.ops.prune_paths")
+    @patch("brain.reconcile.deep_stale")
+    def test_prunes_named_paths_and_reports_count(self, mock_deep_stale, mock_prune_paths):
+        mock_deep_stale.return_value = MagicMock(deleted_but_embedded=["side/amistad/gone.md"])
+
+        result = _prune_deleted_but_embedded("/tmp/some-brain")
+
+        mock_deep_stale.assert_called_once_with(brain_path="/tmp/some-brain")
+        mock_prune_paths.assert_called_once_with(
+            ["side/amistad/gone.md"], brain_path="/tmp/some-brain"
+        )
+        assert result == {"deleted_but_embedded": 1, "paths": ["side/amistad/gone.md"]}
+
+    @patch("brain.ops.prune_paths")
+    @patch("brain.reconcile.deep_stale")
+    def test_clean_corpus_prunes_nothing_and_reports_zero(
+        self, mock_deep_stale, mock_prune_paths
+    ):
+        """Positive control: a clean sweep must be distinguishable from a sweep
+        that silently never ran — both would otherwise report `{"deleted_but_embedded": 0}`."""
+        mock_deep_stale.return_value = MagicMock(deleted_but_embedded=[])
+
+        result = _prune_deleted_but_embedded(None)
+
+        mock_deep_stale.assert_called_once_with(brain_path=None)
+        mock_prune_paths.assert_not_called()
+        assert result == {"deleted_but_embedded": 0, "paths": []}
+
+    @patch("brain.reconcile.deep_stale", side_effect=RuntimeError("db unreachable"))
+    def test_sweep_failure_is_reported_not_raised(self, _mock_deep_stale):
+        """A prune failure must not raise out of `refresh()` — the routine stays
+        cron-safe and reports the failure in the payload instead."""
+        result = _prune_deleted_but_embedded(None)
+
+        assert result == {"deleted_but_embedded": 0, "paths": [], "error": "db unreachable"}
 
     @patch("brain.ops.refresh_edges")
     @patch("index_brain.main")

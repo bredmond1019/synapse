@@ -390,10 +390,16 @@ def refresh(*, rebuild: bool = False, dry_run: bool = False, brain_path: str | N
 
     Returns:
         `{"documents": {"dry_run": bool, "exit_code": int, "success": bool,
-        "errors": [...]}, "edges": {"loaded": N} | {"skipped": True}}` —
+        "errors": [...]}, "edges": {"loaded": N} | {"skipped": True},
+        "pruned": {"deleted_but_embedded": N, "paths": [...]}}` —
         `documents.success` is `False` whenever `index_brain.main()` reported
         a parse/embed/DB failure, so `syn refresh` (and `syn routine refresh`)
-        surface it instead of always reporting a clean run.
+        surface it instead of always reporting a clean run. `pruned` is only
+        present on a non-dry-run: a retirement commit otherwise leaves
+        `brain_documents` rows for deleted sources, which `syn recall` can
+        still score and answer from (the defect this key closes — see
+        `docs/brain-rag.md`). A prune failure is reported inside `pruned`,
+        never raised, so a cron `syn routine refresh` stays cron-safe.
     """
     import index_brain  # pylint: disable=import-outside-toplevel,import-error
 
@@ -420,7 +426,54 @@ def refresh(*, rebuild: bool = False, dry_run: bool = False, brain_path: str | N
         Path(brain_path) if brain_path else index_brain._DEFAULT_BRAIN_PATH  # pylint: disable=protected-access
     )
     loaded = refresh_edges(resolved)
-    return {"documents": documents_payload, "edges": {"loaded": loaded}}
+    pruned_payload = _prune_deleted_but_embedded(brain_path)
+    return {
+        "documents": documents_payload,
+        "edges": {"loaded": loaded},
+        "pruned": pruned_payload,
+    }
+
+
+def _prune_deleted_but_embedded(brain_path: str | None) -> dict:
+    """Sweep `reconcile.deep_stale`'s deleted-but-embedded axis and prune it.
+
+    Called from `refresh()` (never `dry_run`) so a retirement commit that
+    deletes a repo's files cannot leave zombie `brain_documents` rows behind
+    for the incremental indexer to silently never revisit — measured
+    2026-09-06: 257 such rows in the live corpus, none of them ever pruned by
+    the routine path (see `docs/brain-rag.md`). No second write path: this
+    calls the existing `reconcile.deep_stale` detector and the existing
+    `prune_paths` primitive, the same pair `ops.repair_deep_stale` already
+    dispatches by hand for `syn stale --deep --repair`.
+
+    Deliberately swallows any exception — a prune failure must not raise out
+    of `refresh()` and break the cron-safe `syn routine refresh` path; it is
+    reported in the returned payload instead, mirroring how
+    `documents.errors` already surfaces `index_brain` failures without
+    raising.
+
+    Args:
+        brain_path: Optional brain root override, forwarded to both
+            `reconcile.deep_stale` and `prune_paths`.
+
+    Returns:
+        `{"deleted_but_embedded": N, "paths": [...]}` on success (N is 0 on a
+        clean corpus — the positive control distinguishing "nothing to
+        prune" from "the sweep didn't run"), or `{"deleted_but_embedded": 0,
+        "paths": [], "error": "..."}` if the sweep or prune itself raised.
+    """
+    from brain.reconcile import deep_stale  # pylint: disable=import-outside-toplevel
+
+    try:
+        report = deep_stale(brain_path=brain_path)
+        stale_paths = list(report.deleted_but_embedded)
+        if stale_paths:
+            prune_paths(stale_paths, brain_path=brain_path)
+    except Exception as exc:  # pylint: disable=broad-except
+        logger.error("refresh: deleted-but-embedded prune failed: %s", exc)
+        return {"deleted_but_embedded": 0, "paths": [], "error": str(exc)}
+
+    return {"deleted_but_embedded": len(stale_paths), "paths": stale_paths}
 
 
 def _changed_files(root: Path, files: list, session) -> list[str]:

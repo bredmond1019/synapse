@@ -23,7 +23,7 @@ row is proven prunable by the identical instrument.
 from datetime import datetime
 from unittest.mock import patch
 
-from brain.ops import repair_deep_stale
+from brain.ops import refresh, repair_deep_stale
 from brain.reconcile import deep_stale
 from database.brain_document import BrainDocument
 
@@ -143,6 +143,108 @@ class TestZombieRowPrune:
             result = repair_deep_stale(report, brain_path=str(tmp_path))
 
         assert result["actions"] == []
+
+        remaining_paths = sorted(
+            file_path
+            for (file_path,) in pgvector_session.query(BrainDocument.file_path).all()
+        )
+        assert remaining_paths == ["still-here.md"]
+
+
+def _fake_document_index_only(real_main):
+    """`index_brain.main`, real for `--prune-paths` and a no-op otherwise.
+
+    `refresh()` calls `index_brain.main` twice through two different code
+    paths: once for the document-index step (heavy — chunking/embedding,
+    out of scope for this class, which only exercises the new prune step)
+    and once, indirectly via `prune_paths` -> `_run_index_brain`, for
+    `--prune-paths` (a plain DB delete — no embedding, no API call, see
+    `prune_paths`'s docstring). Mocking `index_brain.main` wholesale would
+    silently defeat the prune it is this test's job to prove happened, so
+    only the document-index call is faked; `--prune-paths` calls run for
+    real against the patched `database.session.db_session`.
+    """
+
+    def _dispatch(argv):
+        if "--prune-paths" in argv:
+            return real_main(argv)
+        return 0
+
+    return _dispatch
+
+
+class TestRefreshPrunesZombieRows:
+    """`brain.ops.refresh()` itself must run the deleted-but-embedded prune
+    after its document-index step — not just the manual `syn stale --deep
+    --repair` path `repair_deep_stale` already covers above. This is the
+    guard the block adds: a retirement commit that deletes a repo's files
+    must not leave rows a plain `syn refresh` (the routine/cron path) never
+    revisits.
+
+    The document-index step and `refresh_edges` are faked (this class is not
+    re-proving the index/edge steps, which `TestRefresh` in `test_ops.py`
+    already covers) — only the new prune step runs against a real pgvector
+    session, via the same `database.session.db_session` patch pattern used
+    above.
+    """
+
+    def test_refresh_prunes_exactly_the_vanished_source(self, pgvector_session, tmp_path):
+        _write_brain_toml(tmp_path)
+        (tmp_path / "still-here.md").write_text("body\n", encoding="utf-8")
+
+        pgvector_session.add_all(
+            [
+                _make_doc("still-here.md", doc_id="D1"),
+                _make_doc("side/amistad/gone.md", doc_id="D2"),
+            ]
+        )
+        pgvector_session.flush()
+
+        import index_brain  # pylint: disable=import-outside-toplevel,import-error
+
+        with (
+            patch("index_brain.main", side_effect=_fake_document_index_only(index_brain.main)),
+            patch("brain.ops.refresh_edges", return_value=0),
+            patch(
+                "database.session.db_session",
+                side_effect=_fake_db_session(pgvector_session),
+            ),
+        ):
+            result = refresh(brain_path=str(tmp_path))
+
+        assert result["pruned"] == {
+            "deleted_but_embedded": 1,
+            "paths": ["side/amistad/gone.md"],
+        }
+
+        remaining_paths = sorted(
+            file_path
+            for (file_path,) in pgvector_session.query(BrainDocument.file_path).all()
+        )
+        assert remaining_paths == ["still-here.md"]
+
+    def test_refresh_over_clean_corpus_prunes_nothing(self, pgvector_session, tmp_path):
+        """Positive control: a corpus with no vanished sources must report
+        `deleted_but_embedded: 0` — distinguishable from the prune step never
+        having run at all, which would look identical without this case."""
+        _write_brain_toml(tmp_path)
+        (tmp_path / "still-here.md").write_text("body\n", encoding="utf-8")
+        pgvector_session.add(_make_doc("still-here.md", doc_id="D1"))
+        pgvector_session.flush()
+
+        import index_brain  # pylint: disable=import-outside-toplevel,import-error
+
+        with (
+            patch("index_brain.main", side_effect=_fake_document_index_only(index_brain.main)),
+            patch("brain.ops.refresh_edges", return_value=0),
+            patch(
+                "database.session.db_session",
+                side_effect=_fake_db_session(pgvector_session),
+            ),
+        ):
+            result = refresh(brain_path=str(tmp_path))
+
+        assert result["pruned"] == {"deleted_but_embedded": 0, "paths": []}
 
         remaining_paths = sorted(
             file_path
