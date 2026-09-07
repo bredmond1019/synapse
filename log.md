@@ -1169,7 +1169,7 @@ ece9b35 feat: implement or-x-workflow-divestment-task2
   gates had actually cleared. Also found `syn recall --hybrid --workspace X` silently ignores the
   workspace filter (`app/brain/retrieval.py:106` drops `filters`/`workspace_id`/`session`).
 - **Refs:** `planning/master-plan.md` (Brain Quality section, `OR.X`, `OR.X2`, `OR.R`, `OR.J`, `OR.1.B`);
-  `planning/handoff.md`; brain D51/D52/D49; `core/planning/epics/brain-quality.md`.
+  `planning/handoff.md`; brain D51/D52/D49; `planning/epics/brain-quality.md`.
 
 ---
 
